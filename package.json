@@ -1,0 +1,9 @@
+{
+  "name": "video-to-ascii-studio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local video to ASCII animation tool",
+  "scripts": {
+    "start": "node server.js"
+  }
+}
