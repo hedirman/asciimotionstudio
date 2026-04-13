@@ -29,6 +29,7 @@ const elements = {
   status: document.querySelector("#status"),
   frameCounter: document.querySelector("#frame-counter"),
   tooltipLayer: document.querySelector("#tooltip-layer"),
+  previewCanvas: document.querySelector("#preview-canvas"),
   asciiOutput: document.querySelector("#ascii-output"),
   sourceVideo: document.querySelector("#source-video"),
   frameCanvas: document.querySelector("#frame-canvas"),
@@ -36,6 +37,7 @@ const elements = {
 };
 
 const frameContext = elements.frameCanvas.getContext("2d", { willReadFrequently: true });
+const previewContext = elements.previewCanvas.getContext("2d");
 const recordContext = elements.recordCanvas.getContext("2d");
 
 const state = {
@@ -53,11 +55,17 @@ const state = {
   playbackStartFrame: 0,
   displayedFrameIndex: -1,
   autoConvertHandle: 0,
-  isConverting: false
+  isConverting: false,
+  originalFile: null,
+  activeSourceKind: "original",
+  normalizationAttempted: false,
+  lastSeekFrameIndex: -1,
+  lastSeekTime: 0,
+  currentPreviewFrame: null
 };
 
 const previewResizeObserver = new ResizeObserver(() => {
-  fitAsciiToStage();
+  queuePreviewRefresh();
 });
 
 previewResizeObserver.observe(document.querySelector(".preview-stage"));
@@ -70,13 +78,22 @@ const charsets = {
 };
 
 const exportScale = 1;
+const mediaErrorNames = {
+  1: "MEDIA_ERR_ABORTED",
+  2: "MEDIA_ERR_NETWORK",
+  3: "MEDIA_ERR_DECODE",
+  4: "MEDIA_ERR_SRC_NOT_SUPPORTED"
+};
+
+const readyStateNames = ["HAVE_NOTHING", "HAVE_METADATA", "HAVE_CURRENT_DATA", "HAVE_FUTURE_DATA", "HAVE_ENOUGH_DATA"];
+const networkStateNames = ["NETWORK_EMPTY", "NETWORK_IDLE", "NETWORK_LOADING", "NETWORK_NO_SOURCE"];
 
 window.addEventListener("resize", () => {
-  scheduleFitAsciiToStage();
+  queuePreviewRefresh();
 });
 
 window.addEventListener("orientationchange", () => {
-  scheduleFitAsciiToStage();
+  queuePreviewRefresh();
 });
 
 function updateRangeLabel(input, label, formatter = (value) => value) {
@@ -272,45 +289,241 @@ function setPlaybackButtons(enabled) {
   elements.playToggleButton.setAttribute("data-state", state.isPlaying ? "pause" : "play");
 }
 
-function loadFile(file) {
+function describeSourceKind(sourceKind = state.activeSourceKind) {
+  return sourceKind === "normalized" ? "normalized fallback" : "original upload";
+}
+
+function getMediaErrorName(video = elements.sourceVideo) {
+  return mediaErrorNames[video.error?.code] || "";
+}
+
+function formatSeconds(value) {
+  if (!Number.isFinite(value)) {
+    return "n/a";
+  }
+  return `${value.toFixed(3)}s`;
+}
+
+function buildVideoDiagnostics(error, extra = {}) {
+  const video = elements.sourceVideo;
+  const details = error?.details || {};
+  const targetTime = extra.targetTime ?? details.targetTime ?? state.lastSeekTime;
+  const frameIndex = extra.frameIndex ?? details.frameIndex ?? state.lastSeekFrameIndex;
+
+  return {
+    source: describeSourceKind(extra.sourceKind || state.activeSourceKind),
+    browserError: getMediaErrorName(video),
+    readyState: readyStateNames[video.readyState] || String(video.readyState),
+    networkState: networkStateNames[video.networkState] || String(video.networkState),
+    targetTime,
+    currentTime: Number(video.currentTime) || 0,
+    duration: Number(video.duration) || 0,
+    frameIndex
+  };
+}
+
+function formatClientDiagnostics(error, extra = {}) {
+  const diagnostics = buildVideoDiagnostics(error, extra);
+  const parts = [
+    `Source ${diagnostics.source}`,
+    `readyState ${diagnostics.readyState}`,
+    `networkState ${diagnostics.networkState}`
+  ];
+
+  if (diagnostics.browserError) {
+    parts.push(`browser ${diagnostics.browserError}`);
+  }
+
+  if (diagnostics.frameIndex >= 0) {
+    parts.push(`frame ${diagnostics.frameIndex + 1}`);
+  }
+
+  if (diagnostics.targetTime > 0) {
+    parts.push(`target ${formatSeconds(diagnostics.targetTime)}`);
+  }
+
+  return parts.join(" | ");
+}
+
+function formatProbeSummary(label, probe) {
+  if (!probe || !probe.video) {
+    return "";
+  }
+
+  const parts = [
+    `${label} ${probe.video.codec || "unknown"}`,
+    probe.video.pixelFormat || "unknown",
+    `${probe.video.width || 0}x${probe.video.height || 0}`
+  ];
+
+  if (probe.video.fps) {
+    parts.push(`${probe.video.fps}fps`);
+  }
+
+  return parts.join(" ");
+}
+
+function formatServerDiagnostics(diagnostics) {
+  if (!diagnostics) {
+    return "";
+  }
+
+  const parts = [];
+  const inputSummary = formatProbeSummary("input", diagnostics.input);
+  const outputSummary = formatProbeSummary("fallback", diagnostics.output);
+  if (inputSummary) {
+    parts.push(inputSummary);
+  }
+  if (outputSummary) {
+    parts.push(outputSummary);
+  }
+  if (diagnostics.ffmpeg?.videoCodec || diagnostics.ffmpeg?.pixelFormat) {
+    parts.push(
+      `ffmpeg ${diagnostics.ffmpeg.videoCodec || "unknown"}/${diagnostics.ffmpeg.pixelFormat || "unknown"}`
+    );
+  }
+  return parts.join(" | ");
+}
+
+function updateVideoMeta() {
+  const video = elements.sourceVideo;
+  if (!state.originalFile || !Number.isFinite(video.duration) || !video.videoWidth || !video.videoHeight) {
+    return;
+  }
+
+  elements.videoMeta.textContent =
+    `${state.originalFile.name} • ${video.videoWidth}×${video.videoHeight} • ` +
+    `${video.duration.toFixed(2)}s • ${describeSourceKind()}`;
+}
+
+function resetVideoState() {
   document.querySelector(".upload")?.classList.add("has-file");
 
   if (state.fileUrl) {
     URL.revokeObjectURL(state.fileUrl);
   }
 
+  state.fileUrl = "";
+  state.originalFile = null;
+  state.activeSourceKind = "original";
+  state.normalizationAttempted = false;
+  state.lastSeekFrameIndex = -1;
+  state.lastSeekTime = 0;
+
   stopPlayback();
   state.frames = [];
   state.frameIndex = 0;
   state.displayedFrameIndex = -1;
+  state.currentPreviewFrame = null;
   state.previewMode = "live";
   elements.downloadHtmlButton.disabled = true;
   elements.recordWebmButton.disabled = true;
   setPlaybackButtons(false);
   elements.uploadPrompt.textContent = "";
+}
+
+async function attachVideoSource(url, sourceKind) {
+  const video = elements.sourceVideo;
+  state.activeSourceKind = sourceKind;
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+  video.src = url;
+  video.loop = state.loopEnabled;
+  video.muted = true;
+  video.playsInline = true;
+  video.setAttribute("playsinline", "");
+  video.setAttribute("webkit-playsinline", "true");
+  video.load();
+  await waitForVideoEvent(video, "loadedmetadata");
+  updateVideoMeta();
+}
+
+async function normalizeVideoForBrowser(error, phase) {
+  if (!state.originalFile || state.activeSourceKind === "normalized" || state.normalizationAttempted) {
+    return false;
+  }
+
+  state.normalizationAttempted = true;
+  setStatus("Browser decode failed. Preparing a browser-safe fallback...");
+
+  const response = await fetch("/api/prepare-video", {
+    method: "POST",
+    headers: {
+      "Content-Type": state.originalFile.type || "application/octet-stream",
+      "X-File-Name": state.originalFile.name
+    },
+    body: state.originalFile
+  });
+
+  let payload = null;
+  try {
+    payload = await response.json();
+  } catch (parseError) {
+    payload = null;
+  }
+
+  if (!response.ok) {
+    throw new Error(payload?.error || "The server could not normalize the uploaded video.");
+  }
+
+  const normalizedUrl = `${payload.videoUrl}?t=${Date.now()}`;
+  await attachVideoSource(normalizedUrl, "normalized");
+  return true;
+}
+
+async function initializeLoadedVideo() {
+  try {
+    await prepareVideoForFrameExtraction();
+    await renderLivePreview(0);
+    scheduleAutoConvert("initial");
+    setStatus(
+      state.activeSourceKind === "normalized"
+        ? "Fallback video ready. Building the ASCII animation..."
+        : "Video ready. Building the ASCII animation..."
+    );
+  } catch (error) {
+    try {
+      const recovered = await normalizeVideoForBrowser(error, "preview");
+      if (recovered) {
+        await prepareVideoForFrameExtraction();
+        await renderLivePreview(0);
+        scheduleAutoConvert("initial");
+        setStatus("Fallback video ready. Building the ASCII animation...");
+        return;
+      }
+    } catch (fallbackError) {
+      console.error(fallbackError);
+    }
+
+    console.error(error);
+    setStatus(`Video loaded, but preview could not start: ${error.message}`);
+  }
+}
+
+async function loadFile(file) {
+  resetVideoState();
+  state.originalFile = file;
 
   state.fileUrl = URL.createObjectURL(file);
-  elements.sourceVideo.src = state.fileUrl;
-  elements.sourceVideo.loop = state.loopEnabled;
-  elements.sourceVideo.muted = true;
-  elements.sourceVideo.playsInline = true;
-  elements.sourceVideo.setAttribute("playsinline", "");
-  elements.sourceVideo.setAttribute("webkit-playsinline", "true");
-  elements.sourceVideo.load();
-
-  elements.sourceVideo.onloadedmetadata = async () => {
-    elements.videoMeta.textContent = `${file.name} • ${elements.sourceVideo.videoWidth}×${elements.sourceVideo.videoHeight} • ${elements.sourceVideo.duration.toFixed(2)}s`;
+  try {
+    await attachVideoSource(state.fileUrl, "original");
+    await initializeLoadedVideo();
+  } catch (error) {
+    console.error(error);
 
     try {
-      await prepareVideoForFrameExtraction();
-      await renderLivePreview(0);
-      scheduleAutoConvert("initial");
-      setStatus("Video ready. Building the ASCII animation...");
-    } catch (error) {
-      console.error(error);
-      setStatus(`Video loaded, but preview could not start: ${error.message}`);
+      const recovered = await normalizeVideoForBrowser(error, "load");
+      if (recovered) {
+        await initializeLoadedVideo();
+        return;
+      }
+    } catch (fallbackError) {
+      console.error(fallbackError);
     }
-  };
+
+    setStatus(`Video could not be loaded: ${error.message}`);
+  }
 }
 
 async function prepareVideoForFrameExtraction() {
@@ -383,6 +596,8 @@ async function convertVideo() {
     }
 
     const time = Math.min(duration, index / settings.fps);
+    state.lastSeekFrameIndex = index;
+    state.lastSeekTime = time;
     await seekVideo(video, time);
     frameContext.drawImage(video, 0, 0, sampleWidth, sampleHeight);
 
@@ -413,7 +628,13 @@ function seekVideo(video, time) {
 
     const handleError = () => {
       cleanup();
-      reject(new Error("The video frame could not be decoded."));
+      const error = new Error("The video frame could not be decoded.");
+      error.code = "VIDEO_DECODE_ERROR";
+      error.details = {
+        targetTime: time,
+        frameIndex: state.lastSeekFrameIndex
+      };
+      reject(error);
     };
 
     const cleanup = () => {
@@ -428,7 +649,13 @@ function seekVideo(video, time) {
       video.currentTime = time;
     } catch (error) {
       cleanup();
-      reject(new Error("This browser could not seek through the selected video."));
+      const seekError = new Error("This browser could not seek through the selected video.");
+      seekError.code = "VIDEO_SEEK_ERROR";
+      seekError.details = {
+        targetTime: time,
+        frameIndex: state.lastSeekFrameIndex
+      };
+      reject(seekError);
     }
   });
 }
@@ -480,6 +707,90 @@ function imageDataToAscii(imageData, settings) {
   };
 }
 
+function getPreviewStageMetrics() {
+  const stage = document.querySelector(".preview-stage");
+  if (!stage) {
+    return null;
+  }
+
+  const stageStyle = window.getComputedStyle(stage);
+  const horizontalPadding = parseFloat(stageStyle.paddingLeft) + parseFloat(stageStyle.paddingRight);
+  const verticalPadding = parseFloat(stageStyle.paddingTop) + parseFloat(stageStyle.paddingBottom);
+  const width = Math.max(120, stage.clientWidth - horizontalPadding);
+  const height = Math.max(120, stage.clientHeight - verticalPadding);
+  const devicePixelRatio = window.devicePixelRatio || 1;
+
+  return { width, height, devicePixelRatio };
+}
+
+function syncPreviewCanvas() {
+  const metrics = getPreviewStageMetrics();
+  if (!metrics) {
+    return null;
+  }
+
+  const pixelWidth = Math.max(1, Math.round(metrics.width * metrics.devicePixelRatio));
+  const pixelHeight = Math.max(1, Math.round(metrics.height * metrics.devicePixelRatio));
+
+  if (elements.previewCanvas.width !== pixelWidth || elements.previewCanvas.height !== pixelHeight) {
+    elements.previewCanvas.width = pixelWidth;
+    elements.previewCanvas.height = pixelHeight;
+    elements.previewCanvas.style.width = `${metrics.width}px`;
+    elements.previewCanvas.style.height = `${metrics.height}px`;
+  }
+
+  previewContext.setTransform(metrics.devicePixelRatio, 0, 0, metrics.devicePixelRatio, 0, 0);
+  previewContext.textBaseline = "top";
+  return metrics;
+}
+
+function drawAsciiFrameToCanvas(context, frame, width, height, useColor) {
+  const metrics = getCanvasRenderMetrics(frame.text, width, height);
+  context.clearRect(0, 0, width, height);
+  context.fillStyle = elements.backgroundColor.value;
+  context.fillRect(0, 0, width, height);
+  context.font = `${metrics.fontSize}px "IBM Plex Mono", Consolas, monospace`;
+  context.textBaseline = "top";
+
+  if (useColor && frame.colorRows) {
+    frame.colorRows.forEach((row, rowIndex) => {
+      row.forEach((cell, columnIndex) => {
+        if (cell.character === " ") {
+          return;
+        }
+
+        context.fillStyle = cell.color;
+        context.fillText(
+          cell.character,
+          metrics.offsetX + columnIndex * metrics.characterWidth,
+          metrics.offsetY + rowIndex * metrics.lineAdvance
+        );
+      });
+    });
+    return;
+  }
+
+  context.fillStyle = elements.foregroundColor.value;
+  const lines = frame.text.split("\n");
+  lines.forEach((line, index) => {
+    context.fillText(line, metrics.offsetX, metrics.offsetY + index * metrics.lineAdvance);
+  });
+}
+
+function renderPreviewFrame(frame) {
+  if (!frame) {
+    return;
+  }
+
+  state.currentPreviewFrame = frame;
+  const metrics = syncPreviewCanvas();
+  if (!metrics) {
+    return;
+  }
+
+  drawAsciiFrameToCanvas(previewContext, frame, metrics.width, metrics.height, elements.useColor.checked);
+}
+
 function applyAdjustments(value, settings) {
   const brightened = value + settings.brightness / 255;
   const contrasted = (brightened - 0.5) * settings.contrast + 0.5;
@@ -496,18 +807,7 @@ function renderFrame(index) {
   state.frameIndex = index;
   state.displayedFrameIndex = index;
   applyPreviewColors();
-
-  const useColor = elements.useColor.checked;
-
-  if (useColor) {
-    elements.asciiOutput.classList.add("color");
-    elements.asciiOutput.innerHTML = frame.html;
-  } else {
-    elements.asciiOutput.classList.remove("color");
-    elements.asciiOutput.textContent = frame.text;
-  }
-
-  scheduleFitAsciiToStage(frame.text);
+  renderPreviewFrame(frame);
 }
 
 async function renderLivePreview(time = null) {
@@ -529,15 +829,7 @@ async function renderLivePreview(time = null) {
   state.previewMode = "live";
 
   applyPreviewColors();
-  if (settings.useColor) {
-    elements.asciiOutput.classList.add("color");
-    elements.asciiOutput.innerHTML = frame.html;
-  } else {
-    elements.asciiOutput.classList.remove("color");
-    elements.asciiOutput.textContent = frame.text;
-  }
-
-  scheduleFitAsciiToStage(frame.text);
+  renderPreviewFrame(frame);
 }
 
 function startPlayback() {
@@ -578,16 +870,13 @@ function startPlayback() {
     }
 
     state.frameIndex = nextFrame;
-    const nextExpectedFrame = elapsedFrames + 1;
-    const nextTargetTime = state.playbackStartTime + nextExpectedFrame * frameDelay;
-    const delayUntilNextFrame = Math.max(0, nextTargetTime - performance.now());
-    state.playbackTimer = window.setTimeout(tick, delayUntilNextFrame);
+    state.playbackHandle = window.requestAnimationFrame(tick);
   };
 
   if (state.displayedFrameIndex !== state.frameIndex) {
     renderFrame(state.frameIndex);
   }
-  state.playbackTimer = window.setTimeout(tick, frameDelay);
+  state.playbackHandle = window.requestAnimationFrame(tick);
   setStatus(`Playback running at ${fps} FPS.`);
 }
 
@@ -600,14 +889,10 @@ function stopPlayback() {
   setPlaybackButtons(!!state.frames.length);
 }
 
-function scheduleFitAsciiToStage(frameText = "") {
-  fitAsciiToStage(frameText);
+function queuePreviewRefresh() {
   window.requestAnimationFrame(() => {
-    fitAsciiToStage(frameText);
+    renderPreviewFrame(state.currentPreviewFrame);
   });
-  window.setTimeout(() => {
-    fitAsciiToStage(frameText);
-  }, 0);
 }
 
 function queueLivePreview(time = null) {
@@ -772,35 +1057,7 @@ async function exportMp4() {
 }
 
 function drawFrameToExportCanvas(frame, width, height) {
-  const metrics = getCanvasRenderMetrics(frame.text, width, height);
-  recordContext.fillStyle = elements.backgroundColor.value;
-  recordContext.fillRect(0, 0, width, height);
-  recordContext.font = `${metrics.fontSize}px "IBM Plex Mono", Consolas, monospace`;
-  recordContext.textBaseline = "top";
-
-  if (elements.useColor.checked && frame.colorRows) {
-    frame.colorRows.forEach((row, rowIndex) => {
-      row.forEach((cell, columnIndex) => {
-        if (cell.character === " ") {
-          return;
-        }
-
-        recordContext.fillStyle = cell.color;
-        recordContext.fillText(
-          cell.character,
-          metrics.offsetX + columnIndex * metrics.characterWidth,
-          metrics.offsetY + rowIndex * metrics.lineAdvance
-        );
-      });
-    });
-    return;
-  }
-
-  recordContext.fillStyle = elements.foregroundColor.value;
-  const lines = frame.text.split("\n");
-  lines.forEach((line, index) => {
-    recordContext.fillText(line, metrics.offsetX, metrics.offsetY + index * metrics.lineAdvance);
-  });
+  drawAsciiFrameToCanvas(recordContext, frame, width, height, elements.useColor.checked);
 }
 
 function getCanvasRenderMetrics(frameText, width, height) {
@@ -855,35 +1112,11 @@ function applyPreviewColors() {
   elements.asciiOutput.style.color = elements.useColor.checked
     ? elements.animatedColor.value
     : elements.foregroundColor.value;
+  queuePreviewRefresh();
 }
 
 applyPreviewColors();
 syncLoopButton();
-
-function fitAsciiToStage(frameText = "") {
-  const stage = document.querySelector(".preview-stage");
-  if (!stage) {
-    return;
-  }
-
-  const text = frameText || elements.asciiOutput.textContent || "";
-  const lines = text.split("\n");
-  const columns = Math.max(1, ...lines.map((line) => line.length));
-  const rows = Math.max(1, lines.length);
-  const stageStyle = window.getComputedStyle(stage);
-  const horizontalPadding = parseFloat(stageStyle.paddingLeft) + parseFloat(stageStyle.paddingRight);
-  const verticalPadding = parseFloat(stageStyle.paddingTop) + parseFloat(stageStyle.paddingBottom);
-  const availableWidth = Math.max(120, stage.clientWidth - horizontalPadding);
-  const availableHeight = Math.max(120, stage.clientHeight - verticalPadding);
-
-  const { charWidthRatio, lineHeightRatio } = getDisplayCharacterMetrics();
-  const widthLimitedFontSize = availableWidth / (columns * charWidthRatio);
-  const heightLimitedFontSize = availableHeight / (rows * lineHeightRatio);
-  const fontSize = Math.max(4, Math.min(widthLimitedFontSize, heightLimitedFontSize));
-
-  elements.asciiOutput.style.fontSize = `${fontSize}px`;
-  elements.asciiOutput.style.lineHeight = String(lineHeightRatio);
-}
 
 function getSampleDimensions(settings, video) {
   const requestedWidth = Math.max(16, Math.floor(settings.width));
@@ -894,13 +1127,6 @@ function getSampleDimensions(settings, video) {
   const requestedHeight = Math.max(12, Math.round(sampleWidth * aspectRatio * characterAspectCompensation));
   const sampleHeight = Math.min(requestedHeight, Math.max(12, video.videoHeight));
   return { sampleWidth, sampleHeight };
-}
-
-function getDisplayCharacterMetrics() {
-  return {
-    charWidthRatio: 0.62,
-    lineHeightRatio: 0.72
-  };
 }
 
 function getSamplingCharacterMetrics() {
@@ -950,8 +1176,31 @@ async function runConversion(trigger = "auto") {
   elements.recordWebmButton.disabled = true;
 
   try {
-    await prepareVideoForFrameExtraction();
-    await convertVideo();
+    let conversionRecovered = false;
+
+    try {
+      await prepareVideoForFrameExtraction();
+      await convertVideo();
+    } catch (error) {
+      try {
+        const recovered = await normalizeVideoForBrowser(error, "conversion");
+        if (!recovered) {
+          throw error;
+        }
+        conversionRecovered = true;
+        state.frames = [];
+        state.frameIndex = 0;
+        state.displayedFrameIndex = -1;
+        await prepareVideoForFrameExtraction();
+        await convertVideo();
+      } catch (fallbackError) {
+        if (fallbackError === error) {
+          throw error;
+        }
+        throw error;
+      }
+    }
+
     if (state.frames.length) {
       renderFrame(0);
       setPlaybackButtons(true);
@@ -959,9 +1208,11 @@ async function runConversion(trigger = "auto") {
       elements.recordWebmButton.disabled = false;
       startPlayback();
       setStatus(
-        trigger === "auto"
-          ? `Animation updated automatically with ${state.frames.length} frames.`
-          : `Converted ${state.frames.length} ASCII frames.`
+        conversionRecovered
+          ? `Recovered with fallback video and converted ${state.frames.length} ASCII frames.`
+          : trigger === "auto"
+            ? `Animation updated automatically with ${state.frames.length} frames.`
+            : `Converted ${state.frames.length} ASCII frames.`
       );
     } else {
       setStatus("No frames were generated. Try a different video or settings.");
@@ -983,7 +1234,13 @@ function waitForVideoEvent(video, eventName) {
 
     const handleError = () => {
       cleanup();
-      reject(new Error("The selected video could not be loaded."));
+      const error = new Error("The selected video could not be loaded.");
+      error.code = "VIDEO_LOAD_ERROR";
+      error.details = {
+        targetTime: Number(video.currentTime) || 0,
+        frameIndex: state.lastSeekFrameIndex
+      };
+      reject(error);
     };
 
     const cleanup = () => {
